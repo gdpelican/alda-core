@@ -13,7 +13,7 @@
   {:state   :parsing ; parsing, done, or error
    :line    1
    :column  1
-   :buffer  ""  ; what we have so far of the token being parsed
+   :stack   []
    :parsing nil ; the type of token being parsed
    })
 
@@ -24,23 +24,44 @@
 (def token-names
   {:comment    "comment"
    :clj-sexp   "Clojure S-expression"
-   :clj-vector "Clojure vector"
-   :clj-map    "Clojure map"
    :clj-string "Clojure string"
-   :clj-symbol "Clojure symbol"})
+   :clj-char   "Clojure character"
+   :event-seq  "event sequence"})
+
+(defn determine-current-token
+  [{:keys [stack] :as parser}]
+  (let [token (case (first (peek stack))
+                nil nil
+                \( :clj-sexp
+                \" :clj-string
+                \[ :event-seq
+                (throw
+                  (Exception.
+                    (format "Can't determine token type of buffer: %s"
+                            (peek stack)))))]
+    (-> parser (assoc :parsing token))))
 
 (defn emit-token!
-  [{:keys [buffer tokens-ch] :as parser} token & [content]]
-  (>!! tokens-ch [token (or content buffer)])
-  (-> parser (assoc :buffer "" :parsing nil)))
+  [{:keys [stack tokens-ch] :as parser} token & [content]]
+  (>!! tokens-ch [token (or content (peek stack))])
+  (-> parser (update :stack pop)
+             determine-current-token))
 
 (defn unexpected-char-error
-  [character {:keys [line column parsing]}]
-  (format "Unexpected '%s' in %s at line %s, column %s."
-          character
-          (get token-names parsing parsing)
-          line
-          column))
+  [{:keys [parsing line column] :as parser} character]
+  (let [error-msg (format "Unexpected %s in %s at line %s, column %s."
+                          (if (= :EOF character)
+                            "EOF"
+                            (format "'%s'" character))
+                          (get token-names parsing parsing)
+                          line
+                          column)]
+    (-> parser (emit-token! :error error-msg) (assoc :state :error))))
+
+(defn reject-chars
+  [parser character blacklist]
+  (when (contains? blacklist character)
+    (unexpected-char-error parser character)))
 
 (defn next-line
   [parser]
@@ -50,17 +71,73 @@
   [parser]
   (-> parser (update :column inc)))
 
+(defn append-to-current-buffer
+  [{:keys [stack] :as parser} x]
+  (let [buffer (peek stack)]
+    (update parser :stack #(-> % pop (conj (str buffer x))))))
+
+(defn add-current-buffer-to-last
+  [{:keys [stack] :as parser}]
+  (let [current-buffer (peek stack)
+        popped-stack   (pop stack)
+        last-buffer    (peek popped-stack)
+        last-buffer+   (str last-buffer current-buffer)]
+    (-> parser
+        (assoc :stack (-> popped-stack pop (conj last-buffer+)))
+        determine-current-token)))
+
 (defn read-to-buffer
   [parser x & [size]]
   (let [advance (if (#{\newline "\n"} x)
                   next-line
                   #(-> % (update :column + (or size 1))))]
-    (-> parser (update :buffer str x) advance)))
+    (-> parser (append-to-current-buffer x) advance)))
+
+(defn read-to-new-buffer
+  [parser x & [size]]
+  (-> parser (update :stack conj "")
+             (read-to-buffer x size)))
+
+(defn read-whitespace
+  [parser character]
+  (when (#{\newline \space \,} character)
+    (-> parser (read-to-buffer character))))
+
+(defn ensure-parsing
+  [{:keys [state] :as parser}]
+  (when (not= :parsing state)
+    parser))
 
 (defn ignore-return-character
   [parser character]
   (when (= \return character)
     parser))
+
+(defn start-parsing-clj-sexp
+  [parser character]
+  (when (= \( character)
+    (-> parser (read-to-new-buffer \()
+               (assoc :parsing :clj-sexp))))
+
+(defn start-parsing-clj-string
+  [parser character]
+  (when (= \" character)
+    (-> parser (read-to-new-buffer \")
+               (assoc :parsing :clj-string))))
+
+(defn start-parsing-clj-char
+  [parser character]
+  (when (= \\ character)
+    (-> parser (read-to-new-buffer \\)
+               (assoc :parsing :clj-char))))
+
+(defn start-parsing-comment
+  [parser character]
+  (when (= \# character)
+    (-> parser
+        (update :stack conj "")
+        (assoc :parsing :comment)
+        next-column)))
 
 (defn parse-comment
   [{:keys [parsing] :as parser} character]
@@ -69,75 +146,53 @@
       (-> parser (emit-token! :comment) next-line)
       (-> parser (read-to-buffer character)))))
 
-(defn parse-clj-sexp
-  [{:keys [parsing balance] :as parser} character]
-  (when (= :clj-sexp parsing)
+(defn parse-clj-string
+  [{:keys [parsing stack] :as parser} character]
+  (when (= :clj-string parsing)
     (cond
-      (= \newline character)
-      (-> parser next-line (update :buffer str \newline))
-
-      (= \space character)
-      (-> parser (read-to-buffer \space))
-
-      (= \, character)
-      (-> parser (read-to-buffer \,))
-
-      (= \( character)
-      (-> parser (read-to-buffer \() (update :balance conj \())
-
-      (= \[ character)
-      (-> parser (read-to-buffer \[)
-                 (update :balance conj \[)
-                 (assoc :parsing :clj-vector))
-
-      (= \{ character)
-      (-> parser (read-to-buffer \{)
-                 (update :balance conj \{)
-                 (assoc :parsing :clj-map))
+      (= \\ (last (peek stack)))
+      (-> parser (read-to-buffer character))
 
       (= \" character)
-      (-> parser (read-to-buffer \")
-                 (update :balance conj \")
-                 (assoc :parsing :clj-string))
+      (-> parser (read-to-buffer character) add-current-buffer-to-last)
 
-      (= \' character)
-      (-> parser (read-to-buffer \') (assoc :parsing :clj-symbol))
-
-      (= \) character)
-      (cond
-        (= [\(] balance)
-        (-> parser (read-to-buffer \))
-                   (emit-token! :clj-expr)
-                   (assoc :balance nil))
-
-        (= \( (last balance))
-        (let [balance (subvec balance 0 (dec (count balance)))]
-          (-> parser (read-to-buffer \))
-                     (assoc :balance balance
-                            :parsing (case (last balance)
-                                       \( :clj-sexp
-                                       \[ :clj-vector
-                                       \{ :clj-map))))
-
-        :else
-        (-> parser
-            (emit-token! :error (unexpected-char-error character parser))
-            (assoc :state :error)))
-
-      :else ; FIXME
+      :else
       (-> parser (read-to-buffer character)))))
 
-(defn start-parsing-clj-sexp
-  [parser character]
-  (when (= \( character)
-    (-> parser (read-to-buffer \()
-               (assoc :balance [\(]
-                      :parsing :clj-sexp))))
 
-(defn start-parsing-comment
-  [parser character]
-  (when (= \# character)
-    (-> parser (assoc :parsing :comment :buffer "") next-column)))
+(defn parse-clj-char
+  [{:keys [parsing stack] :as parser} character]
+  (when (= :clj-char parsing)
+    (cond
+      (empty? (peek stack))
+      (-> parser (read-to-buffer character))
+
+      ((set "0123456789abcdefghijklmnopqrstuvwxyz") character)
+      (-> parser (read-to-buffer character))
+
+      :else
+      (-> parser (read-to-buffer character) add-current-buffer-to-last))))
+
+(defn finish-parsing-clj-sexp
+  [{:keys [stack] :as parser} character]
+  (when (= \) character)
+    (let [emit-or-continue-parsing-parent (if (= \( (-> stack pop peek first))
+                                            add-current-buffer-to-last
+                                            #(emit-token! % :clj-expr))]
+      (-> parser (read-to-buffer \)) emit-or-continue-parsing-parent))))
+
+(defn parse-clj-sexp
+  [{:keys [parsing stack] :as p} c]
+  (when (= :clj-sexp parsing)
+    (or (reject-chars p c #{:EOF})
+        (read-whitespace p c)
+        (parse-clj-string p c)
+        (parse-clj-char p c)
+        (start-parsing-clj-sexp p c)
+        (start-parsing-clj-string p c)
+        (start-parsing-clj-char p c)
+        (finish-parsing-clj-sexp p c)
+        (read-to-buffer p c))))
 
 (defn finish-parsing
   [parser character]
@@ -153,9 +208,11 @@
 
 (defn read-character!
   [p c]
-  (or (ignore-return-character p c)
+  (or (ensure-parsing p)
+      (ignore-return-character p c)
       (parse-comment p c)
       (parse-clj-sexp p c)
+      (parse-clj-char p c)
       (start-parsing-clj-sexp p c)
       (start-parsing-comment p c)
       (finish-parsing p c)
@@ -174,11 +231,11 @@
 
     ; parse tokens from chars-ch and feed them to tokens-ch
     (thread
-      (loop [parser (parser tokens-ch)]
+      (loop [{:keys [state] :as parser} (parser tokens-ch)]
         (if-let [character (<!! chars-ch)]
           (recur (read-character! parser character))
           (do
-            (>!! tokens-ch parser)
+            (>!! tokens-ch (dissoc parser :tokens-ch))
             (close! tokens-ch)))))
 
     ; temp: print out tokens as they are parsed
