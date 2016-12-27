@@ -10,11 +10,12 @@
             [alda.lisp.score          :as    score]))
 
 (def initial-parser-state
-  {:state   :parsing ; parsing, done, or error
-   :line    1
-   :column  1
-   :stack   []
-   :parsing nil ; the type of token being parsed
+  {:state          :parsing ; parsing, done, or error
+   :line           1
+   :column         1
+   :stack          []       ; context for nesting tokens
+   :pending-tokens []       ; context for consecutive tokens
+   :parsing        nil      ; the type of token being parsed
    })
 
 (defn parser
@@ -30,33 +31,53 @@
 
 (defn determine-current-token
   [{:keys [stack] :as parser}]
-  (let [token (case (first (peek stack))
-                nil nil
-                \( :clj-sexp
-                \" :clj-string
-                \[ :event-seq
-                (throw
-                  (Exception.
-                    (format "Can't determine token type of buffer: %s"
-                            (peek stack)))))]
+  (let [buffer (peek stack)
+        token  (case (first buffer)
+                 nil nil
+                 \( :clj-sexp
+                 \" :clj-string
+                 \[ :event-seq
+                 (throw
+                   (Exception.
+                     (format "Can't determine token type of buffer: %s"
+                             buffer))))]
     (-> parser (assoc :parsing token))))
 
 (defn emit-token!
   [{:keys [stack tokens-ch] :as parser} token & [content]]
   (>!! tokens-ch [token (or content (peek stack))])
-  (-> parser (update :stack pop)
+  (-> parser (update :stack #(if (empty? %) % (pop %)))
              determine-current-token))
+
+(defn add-to-pending-tokens
+  [parser token]
+  (-> parser (update :pending-tokens conj token)
+             (update :stack #(if (empty? %) % (pop %)))
+             determine-current-token))
+
+(defn flush-pending-tokens
+  [{:keys [pending-tokens] :as parser}]
+  ; TODO: handle chords, variables
+  (doseq [[token content] pending-tokens]
+    (emit-token! parser token content))
+  (-> parser (update :pending-tokens empty)))
 
 (defn unexpected-char-error
   [{:keys [parsing line column] :as parser} character]
-  (let [error-msg (format "Unexpected %s in %s at line %s, column %s."
+  (let [error-msg (format "Unexpected %s%s at line %s, column %s."
                           (if (= :EOF character)
                             "EOF"
                             (format "'%s'" character))
-                          (get token-names parsing parsing)
+                          (if (#{nil :???} parsing)
+                            ""
+                            (str " in " (get token-names parsing parsing)))
                           line
                           column)]
     (-> parser (emit-token! :error error-msg) (assoc :state :error))))
+
+(defn caught-error
+  [{:keys [parsing line column] :as parser} e]
+  (-> parser (emit-token! :error e) (assoc :state :error)))
 
 (defn reject-chars
   [parser character blacklist]
@@ -71,10 +92,17 @@
   [parser]
   (-> parser (update :column inc)))
 
+(defn advance
+  [parser x & [size]]
+  (if (#{\newline "\n"} x)
+    (-> parser next-line)
+    (-> parser (update :column + (or size 1)))))
+
 (defn append-to-current-buffer
   [{:keys [stack] :as parser} x]
-  (let [buffer (peek stack)]
-    (update parser :stack #(-> % pop (conj (str buffer x))))))
+  (if-let [buffer (peek stack)]
+    (update parser :stack #(-> % pop (conj (str buffer x))))
+    parser))
 
 (defn add-current-buffer-to-last
   [{:keys [stack] :as parser}]
@@ -88,20 +116,22 @@
 
 (defn read-to-buffer
   [parser x & [size]]
-  (let [advance (if (#{\newline "\n"} x)
-                  next-line
-                  #(-> % (update :column + (or size 1))))]
-    (-> parser (append-to-current-buffer x) advance)))
+  (-> parser (append-to-current-buffer x) (advance x size)))
 
 (defn read-to-new-buffer
   [parser x & [size]]
   (-> parser (update :stack conj "")
              (read-to-buffer x size)))
 
-(defn read-whitespace
-  [parser character]
-  (when (#{\newline \space \,} character)
+(defn read-chars
+  [parser character whitelist]
+  (when (contains? whitelist character)
     (-> parser (read-to-buffer character))))
+
+(defn discard-buffer
+  [parser]
+  (-> parser (update :stack pop)
+             determine-current-token))
 
 (defn ensure-parsing
   [{:keys [state] :as parser}]
@@ -113,31 +143,46 @@
   (when (= \return character)
     parser))
 
-(defn start-parsing-clj-sexp
+(defn skip-whitespace
   [parser character]
-  (when (= \( character)
-    (-> parser (read-to-new-buffer \()
-               (assoc :parsing :clj-sexp))))
+  (when (#{\newline \space} character)
+    (advance parser character)))
+
+(defn start-parsing
+  [parser character token & [{:keys [start-char ignore-first-char]}]]
+  (when (or (nil? start-char)
+            (= start-char character)
+            (and (set? start-char) (contains? start-char character)))
+    (let [init-buffer #(if ignore-first-char
+                         (-> % (advance character) (update :stack conj ""))
+                         (-> % (read-to-new-buffer character)))]
+      (-> parser init-buffer (assoc :parsing token)))))
+
+(defn start-parsing-clj-sexp
+  [p c]
+  (start-parsing p c :clj-sexp {:start-char \(}))
 
 (defn start-parsing-clj-string
-  [parser character]
-  (when (= \" character)
-    (-> parser (read-to-new-buffer \")
-               (assoc :parsing :clj-string))))
+  [p c]
+  (start-parsing p c :clj-string {:start-char \"}))
 
 (defn start-parsing-clj-char
-  [parser character]
-  (when (= \\ character)
-    (-> parser (read-to-new-buffer \\)
-               (assoc :parsing :clj-char))))
+  [p c]
+  (start-parsing p c :clj-char {:start-char \\}))
 
 (defn start-parsing-comment
-  [parser character]
-  (when (= \# character)
-    (-> parser
-        (update :stack conj "")
-        (assoc :parsing :comment)
-        next-column)))
+  [p c]
+  (start-parsing p c :comment {:start-char \# :ignore-first-char true}))
+
+(defn start-parsing-note-or-name
+  [p c]
+  (start-parsing p c :???
+                 {:start-char (set (str "abcdefghijklmnopqrstuvwxyz"
+                                        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"))}))
+
+(defn start-parsing-chord-or-instrument-call
+  [p c]
+
 
 (defn parse-comment
   [{:keys [parsing] :as parser} character]
@@ -158,7 +203,6 @@
 
       :else
       (-> parser (read-to-buffer character)))))
-
 
 (defn parse-clj-char
   [{:keys [parsing stack] :as parser} character]
@@ -185,7 +229,7 @@
   [{:keys [parsing stack] :as p} c]
   (when (= :clj-sexp parsing)
     (or (reject-chars p c #{:EOF})
-        (read-whitespace p c)
+        (read-chars p c #{\newline \space \,})
         (parse-clj-string p c)
         (parse-clj-char p c)
         (start-parsing-clj-sexp p c)
@@ -194,30 +238,79 @@
         (finish-parsing-clj-sexp p c)
         (read-to-buffer p c))))
 
+(declare read-character!)
+
+(defn parse-note-or-rest
+  [{:keys [parsing stack] :as parser} character]
+  (when (= :note-or-rest parsing)
+    (let [buffer (peek stack)]
+      (if (#{\space \newline \~ \| \d} character)
+        (-> parser (read-to-buffer character))
+        (-> parser (add-to-pending-tokens (if (= \r (first buffer))
+                                            [:rest buffer]
+                                            [:note buffer]))
+                   (read-character! character))))))
+
+(defn parse-name
+  [{:keys [parsing stack] :as parser} character]
+  (when (= :name parsing)
+    (let [buffer (peek stack)]
+      (if ((set (str "abcdefghijklmnopqrstuvwxyz"
+                     "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                     "0123456789_-"))
+           character)
+        (-> parser (read-to-buffer character))
+        (-> parser (add-to-pending-tokens [:name buffer])
+                   (read-character! character))))))
+
+(defn parse-note-rest-or-name
+  "Parse a character that could be part of:
+   - a variable name
+   - a note
+   - a rest
+   - an instrument call"
+  [{:keys [parsing stack pending-tokens] :as parser} character]
+  (when (= :??? parsing)
+    (let [buffer (peek stack)]
+      (cond
+        (= 1 (count buffer))
+        (-> parser (read-to-buffer character))
+
+        (re-matches #"[abcdefgr][\d\|\~\s]" buffer)
+        (-> parser (assoc :parsing :note-or-rest) (read-character! character))
+
+        (re-matches #"[a-zA-Z]{2}" buffer)
+        (-> parser (assoc :parsing :name) (read-character! character))
+
+        :else
+        (-> parser (unexpected-char-error character))))))
+
 (defn finish-parsing
   [parser character]
   (when (= :EOF character)
-    (assoc parser :state :done)))
-
-; temp
-(defn skip-chars
-  [parser character]
-  (if (= \newline character)
-    (-> parser next-line)
-    (-> parser next-column)))
+    (-> parser flush-pending-tokens (assoc :state :done))))
 
 (defn read-character!
   [p c]
-  (or (ensure-parsing p)
-      (ignore-return-character p c)
-      (parse-comment p c)
-      (parse-clj-sexp p c)
-      (parse-clj-char p c)
-      (start-parsing-clj-sexp p c)
-      (start-parsing-comment p c)
-      (finish-parsing p c)
-      ; TODO: parse more stuff
-      (skip-chars p c)))
+  (try
+    (or (ensure-parsing p)
+        (finish-parsing p c)
+        (ignore-return-character p c)
+        (parse-comment p c)
+        (parse-clj-sexp p c)
+        (parse-clj-string p c)
+        (parse-clj-char p c)
+        (parse-note-or-rest p c)
+        (parse-name p c)
+        (parse-note-rest-or-name p c)
+        (start-parsing-clj-sexp p c)
+        (start-parsing-comment p c)
+        (start-parsing-note-or-name p c)
+        (start-parsing-chord-or-instrument-call p c)
+        (skip-whitespace p c)
+        (unexpected-char-error p c))
+    (catch Throwable e
+      (caught-error p e))))
 
 (defn parse-input
   [input]
