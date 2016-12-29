@@ -23,11 +23,15 @@
   (assoc initial-parser-state :tokens-ch tokens-ch))
 
 (def token-names
-  {:comment    "comment"
-   :clj-sexp   "Clojure S-expression"
-   :clj-string "Clojure string"
-   :clj-char   "Clojure character"
-   :event-seq  "event sequence"})
+  {:comment           "comment"
+   :clj-sexp          "Clojure S-expression"
+   :clj-string        "Clojure string"
+   :clj-char          "Clojure character"
+   :event-seq         "event sequence"
+   :note              "note"
+   :rest              "rest"
+   :note-or-rest      "note or rest"
+   :note-rest-or-name "note, rest, or name"})
 
 (defn determine-current-token
   [{:keys [stack] :as parser}]
@@ -174,15 +178,28 @@
   [p c]
   (start-parsing p c :comment {:start-char \# :ignore-first-char true}))
 
-(defn start-parsing-note-or-name
+(defn start-parsing-note-or-rest
+  [p c & [opts]]
+  (start-parsing p c :note-or-rest opts))
+
+(defn start-parsing-name
+  [p c & [opts]]
+  (start-parsing p c :name opts))
+
+(defn start-parsing-note-rest-or-name
   [p c]
-  (start-parsing p c :???
+  (start-parsing p c :note-rest-or-name
                  {:start-char (set (str "abcdefghijklmnopqrstuvwxyz"
                                         "ABCDEFGHIJKLMNOPQRSTUVWXYZ"))}))
 
 (defn start-parsing-chord-or-instrument-call
-  [p c]
-
+  [{:keys [pending-tokens] :as p} c]
+  (case (ffirst pending-tokens)
+    :note (start-parsing-note-or-rest p c {:start-char \/ :ignore-first-char true})
+    :rest (start-parsing-note-or-rest p c {:start-char \/ :ignore-first-char true})
+    :name (start-parsing-name p c {:start-char \/ :ignore-first-char true})
+    (when (= \/ c)
+      (unexpected-char-error p c))))
 
 (defn parse-comment
   [{:keys [parsing] :as parser} character]
@@ -244,8 +261,27 @@
   [{:keys [parsing stack] :as parser} character]
   (when (= :note-or-rest parsing)
     (let [buffer (peek stack)]
-      (if (#{\space \newline \~ \| \d} character)
+      (cond
+        (empty? buffer)
+        (cond
+          (#{\newline \space} character)
+          (advance parser character)
+
+          (#{\a \b \c \d \e \f \g \r} character)
+          (-> parser (read-to-buffer character))
+
+          :else
+          (-> parser (unexpected-char-error character)))
+
+        (#{\+ \-} character)
+        (if (re-matches #"[abcdefg][+-]*" buffer)
+          (-> parser (read-to-buffer character))
+          (-> parser (unexpected-char-error character)))
+
+        (#{\space \newline \~ \| \0 \1 \2 \3 \4 \5 \6 \7 \8 \9} character)
         (-> parser (read-to-buffer character))
+
+        :else
         (-> parser (add-to-pending-tokens (if (= \r (first buffer))
                                             [:rest buffer]
                                             [:note buffer]))
@@ -255,11 +291,17 @@
   [{:keys [parsing stack] :as parser} character]
   (when (= :name parsing)
     (let [buffer (peek stack)]
-      (if ((set (str "abcdefghijklmnopqrstuvwxyz"
-                     "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-                     "0123456789_-"))
-           character)
+      (cond
+        (and (empty? buffer) (#{\newline \space} character))
+        (advance parser character)
+
+        ((set (str "abcdefghijklmnopqrstuvwxyz"
+                   "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                   "0123456789_-"))
+         character)
         (-> parser (read-to-buffer character))
+
+        :else
         (-> parser (add-to-pending-tokens [:name buffer])
                    (read-character! character))))))
 
@@ -270,7 +312,7 @@
    - a rest
    - an instrument call"
   [{:keys [parsing stack pending-tokens] :as parser} character]
-  (when (= :??? parsing)
+  (when (= :note-rest-or-name parsing)
     (let [buffer (peek stack)]
       (cond
         (= 1 (count buffer))
@@ -305,7 +347,7 @@
         (parse-note-rest-or-name p c)
         (start-parsing-clj-sexp p c)
         (start-parsing-comment p c)
-        (start-parsing-note-or-name p c)
+        (start-parsing-note-rest-or-name p c)
         (start-parsing-chord-or-instrument-call p c)
         (skip-whitespace p c)
         (unexpected-char-error p c))
